@@ -23,10 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Requires Settings -> Pages -> Source: "GitHub Actions" (a one-time switch;
+      # GITHUB_TOKEN is not allowed to create the Pages site itself).
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       # The game is a static site already: index.html sits at the repo root.
       - name: Upload site
