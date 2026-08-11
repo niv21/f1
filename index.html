@@ -49,6 +49,11 @@
     background: rgba(255,255,255,.14); overflow: hidden;
   }
   #lapfill { height: 100%; width: 0%; background: linear-gradient(90deg, #e10600, #ff8a00); transition: width .1s linear; }
+  #modeTag {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: calc(max(16px, env(safe-area-inset-bottom)) + 14px);
+    font-size: 10px; letter-spacing: .22em; text-transform: uppercase; color: #8d95a3;
+  }
 
   /* ---------- Overlays ---------- */
   .overlay {
@@ -75,6 +80,43 @@
     box-shadow: 0 10px 30px rgba(225,6,0,.38);
   }
   .btn:active { transform: translateY(1px); }
+  .btn.ghost {
+    background: transparent; color: #aeb6c2; box-shadow: none;
+    border: 1px solid rgba(255,255,255,.22); padding: 12px 26px; font-size: 12px;
+  }
+  .btn.ghost:hover { color: #fff; border-color: rgba(255,255,255,.45); }
+  :focus-visible { outline: 3px solid #ffd166; outline-offset: 3px; }
+
+  /* ---------- Mode picker ---------- */
+  #modes {
+    display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+    pointer-events: auto;
+  }
+  .mode {
+    cursor: pointer; background: rgba(255,255,255,.06); color: #aeb6c2;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+    padding: 10px 16px; min-width: 104px;
+    font: inherit; font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+  }
+  .mode small {
+    display: block; margin-top: 3px;
+    font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: none; color: #6e7684;
+  }
+  .mode[aria-pressed="true"] {
+    background: rgba(225,6,0,.18); border-color: #e10600; color: #fff;
+  }
+  .mode[aria-pressed="true"] small { color: #ff9a95; }
+
+  /* ---------- Sound toggle ---------- */
+  #sound {
+    position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+    z-index: 7; pointer-events: auto; cursor: pointer;
+    width: 40px; height: 40px; border-radius: 50%;
+    background: rgba(10,12,16,.62); border: 1px solid rgba(255,255,255,.16);
+    color: #fff; font-size: 17px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #sound.off { color: #6e7684; }
   .flagstrip {
     width: min(90%, 460px); height: 14px;
     background-image:
@@ -112,6 +154,10 @@
   #tRight { left: calc(max(18px, env(safe-area-inset-left)) + 92px); }
   #tBrake { right: calc(max(18px, env(safe-area-inset-right)) + 92px); font-size: 12px; letter-spacing: .1em; }
   #tGas   { right: max(18px, env(safe-area-inset-right)); background: rgba(225,6,0,.28); border-color: rgba(255,90,84,.6); font-size: 12px; letter-spacing: .1em; }
+
+  @media (prefers-reduced-motion: reduce) {
+    #hud, #lapfill { transition: none; }
+  }
 </style>
 </head>
 <body>
@@ -128,8 +174,11 @@
       <div class="label">Position</div>
       <div class="value"><span id="pos">8</span><small>/ 8</small></div>
     </div>
+    <div id="modeTag"></div>
     <div id="lapbar"><div id="lapfill"></div></div>
   </div>
+
+  <button id="sound" type="button" aria-label="Toggle sound" aria-pressed="true">♪</button>
 
   <div id="touch">
     <div class="tbtn" id="tLeft">‹</div>
@@ -143,6 +192,11 @@
     <h1>Birthday<br><span class="accent">Grand Prix</span></h1>
     <div class="flagstrip"></div>
     <p class="sub">One lap. Full throttle. Something special waits at the chequered flag.</p>
+    <div id="modes" role="group" aria-label="Race mode">
+      <button class="mode" type="button" data-mode="party" aria-pressed="true">Birthday<small>Relaxed — the win is yours</small></button>
+      <button class="mode" type="button" data-mode="race" aria-pressed="false">Grand Prix<small>A fair fight</small></button>
+      <button class="mode" type="button" data-mode="pro" aria-pressed="false">Pro<small>No mercy, no help</small></button>
+    </div>
     <button class="btn" id="startBtn">Start Engine</button>
     <div class="keys" id="keyHints">
       <span><b>↑</b>throttle</span><span><b>↓</b>brake</span><span><b>←</b><b>→</b>steer</span>
@@ -158,7 +212,9 @@
       <div>Finish<b id="fPos">—</b></div>
       <div>Top speed<b id="fSpeed">—</b></div>
     </div>
+    <p class="sub" id="fVerdict"></p>
     <button class="btn" id="againBtn">Race Again</button>
+    <button class="btn ghost" id="modeBtn">Change mode</button>
   </div>
 </div>
 
@@ -184,16 +240,49 @@
   var FOV         = 100;
   var CAMERA_H    = 1100;
   var CAM_DEPTH   = 1 / Math.tan((FOV / 2) * Math.PI / 180);
-  var CENTRIFUGAL = 0.32;
 
   var MAX_SPEED   = SEG_LEN * 60;          // world units per second
   var ACCEL       = MAX_SPEED / 5.5;
   var BRAKING     = -MAX_SPEED / 1.6;
   var DECEL       = -MAX_SPEED / 6;
-  var OFF_DECEL   = -MAX_SPEED / 1.8;
-  var OFF_MAX     = MAX_SPEED / 3.6;
   var CAR_WIDTH   = 1150;                  // rival car width in world units
   var TOP_KMH     = 336;                   // speedo reading at MAX_SPEED
+
+  // ------------------------------------------------------------------ modes
+  // Everything that separates a relaxed birthday lap from a real fight lives here.
+  // rubber: how hard rivals ease off when ahead / push when behind (0 = honest race).
+  var MODES = {
+    party: {
+      id: "party", name: "Birthday", tag: "Birthday mode",
+      rivalSpeed: 0.62, rivalSpread: 0.020,
+      rubber: 1, centrifugal: 0.28,
+      offDecel: -MAX_SPEED / 2.6, offMax: MAX_SPEED / 2.6
+    },
+    race: {
+      id: "race", name: "Grand Prix", tag: "Grand Prix",
+      rivalSpeed: 0.70, rivalSpread: 0.021,
+      rubber: 0.35, centrifugal: 0.32,
+      offDecel: -MAX_SPEED / 1.8, offMax: MAX_SPEED / 3.6
+    },
+    pro: {
+      id: "pro", name: "Pro", tag: "Pro mode",
+      rivalSpeed: 0.84, rivalSpread: 0.018,
+      rubber: 0, centrifugal: 0.40,
+      offDecel: -MAX_SPEED / 1.2, offMax: MAX_SPEED / 4.6
+    }
+  };
+
+  var MODE_QUERY = (location.search.match(/[?&]mode=(party|race|pro)/) || [])[1];
+  var M = MODES[MODE_QUERY] || MODES[store("f1mode")] || MODES.party;
+
+  // localStorage is unavailable in some privacy modes; never let that break the game.
+  function store(key, value) {
+    try {
+      if (value === undefined) return localStorage.getItem(key);
+      localStorage.setItem(key, value);
+    } catch (e) { /* ignore */ }
+    return null;
+  }
 
   var COLORS = {
     sky1: "#0b1b3a", sky2: "#2b4d86", sky3: "#e08a4a",
@@ -309,7 +398,7 @@
   var state = STATE.INTRO;
 
   var player = { z: 0, x: 0, speed: 0, steer: 0, bump: 0, topSpeed: 0 };
-  var raceTime = 0, lightsT = 0, finishPos = 1;
+  var raceTime = 0, lightsT = 0, finishPos = 1, lightsBeeped = 0;
 
   var RIVALS = [
     { color: "#e10600", accent: "#ffffff" },
@@ -324,16 +413,19 @@
 
   function resetRace() {
     player.z = 0; player.x = 0; player.speed = 0; player.steer = 0; player.bump = 0; player.topSpeed = 0;
-    raceTime = 0; lightsT = 0; finishPos = 1;
+    raceTime = 0; lightsT = 0; finishPos = 1; lightsBeeped = 0;
     confetti.length = 0;
     fxDirty = true;
 
     cars = RIVALS.map(function (r, i) {
+      var base = MAX_SPEED * (M.rivalSpeed + i * M.rivalSpread);
       return {
         color: r.color, accent: r.accent,
         z: (i + 1) * SEG_LEN * (FAST ? 5 : 9) + SEG_LEN * 11,
         x: (i % 2 ? 1 : -1) * (0.28 + (i % 3) * 0.2),
-        speed: MAX_SPEED * (0.70 + i * 0.021),
+        baseSpeed: base,
+        speed: base,
+        pace: 1,                                  // smoothed rubber-band factor
         drift: (Math.random() * 2 - 1) * 0.3
       };
     });
@@ -350,12 +442,16 @@
     if (k === "ArrowDown"  || k === "s" || k === "S") { keys.brake = down; e.preventDefault(); }
     if (down && (k === " " || k === "Enter")) {
       e.preventDefault();
-      if (state === STATE.INTRO) startRace();
-      else if (state === STATE.FINISH) restart();
+      if (state === STATE.INTRO || state === STATE.FINISH) startRace();
     }
   }
   addEventListener("keydown", function (e) { keyFlag(e, true); }, { passive: false });
   addEventListener("keyup",   function (e) { keyFlag(e, false); }, { passive: false });
+
+  // Leaving the window with a key held would otherwise stick the throttle on.
+  addEventListener("blur", function () {
+    keys.left = keys.right = keys.gas = keys.brake = false;
+  });
 
   var isTouch = matchMedia("(pointer: coarse)").matches || "ontouchstart" in window;
   if (isTouch) document.body.classList.add("touch");
@@ -381,16 +477,21 @@
   var elTouch  = document.getElementById("touch");
 
   function startRace() {
+    audio.start();
     resetRace();
+    document.getElementById("modeTag").textContent = M.tag;
     elIntro.classList.add("hidden");
+    elFinish.classList.add("hidden");
     elHud.classList.add("on");
     elTouch.classList.add("on");
     state = STATE.LIGHTS;
   }
 
-  function restart() {
+  function showIntro() {
     elFinish.classList.add("hidden");
-    startRace();
+    elIntro.classList.remove("hidden");
+    state = STATE.INTRO;
+    resetRace();
   }
 
   function endRace() {
@@ -401,13 +502,38 @@
     document.getElementById("fPos").textContent = ordinal(finishPos);
     document.getElementById("fSpeed").textContent =
       Math.round(player.topSpeed / MAX_SPEED * TOP_KMH) + " km/h";
+    document.getElementById("fVerdict").textContent = verdict();
     elFinish.classList.remove("hidden");
-    burstConfetti(180);
+    burstConfetti(reducedMotion ? 90 : 180);
+    audio.fanfare();
+  }
+
+  function verdict() {
+    if (finishPos === 1) return "Chequered flag, P1 — " + M.name + " mode. Many happy returns!";
+    if (M.id === "party") return "P" + finishPos + " in " + M.name + " mode — the cake is still yours.";
+    return "P" + finishPos + " in " + M.name + " mode — race again for the win.";
   }
 
   document.getElementById("startBtn").addEventListener("click", startRace);
-  document.getElementById("againBtn").addEventListener("click", restart);
+  document.getElementById("againBtn").addEventListener("click", startRace);
+  document.getElementById("modeBtn").addEventListener("click", showIntro);
   if (isTouch) document.getElementById("keyHints").style.display = "none";
+
+  // ---------------------------------------------------------------- mode pick
+  var modeButtons = [].slice.call(document.querySelectorAll(".mode"));
+  modeButtons.forEach(function (b) {
+    b.addEventListener("click", function () { selectMode(b.getAttribute("data-mode")); });
+  });
+
+  function selectMode(id) {
+    if (!MODES[id]) return;
+    M = MODES[id];
+    store("f1mode", id);
+    modeButtons.forEach(function (b) {
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-mode") === id));
+    });
+  }
+  selectMode(M.id);
 
   function formatTime(t) {
     var m = Math.floor(t / 60), s = t - m * 60;
@@ -422,10 +548,18 @@
   function update(dt) {
     if (state === STATE.LIGHTS) {
       lightsT += dt;
+      var lit = Math.min(5, Math.floor(lightsT / 0.75));
+      while (lightsBeeped < lit) { lightsBeeped++; audio.light(lightsBeeped); }
+      if (lightsT > 4.4 && lightsBeeped === 5) { lightsBeeped = 6; audio.light(6); }
+      audio.drive(0, false, true);
       if (lightsT > 5.2) state = STATE.RACING;
       return;
     }
-    if (state !== STATE.RACING) { updateConfetti(dt); return; }
+    if (state !== STATE.RACING) {
+      audio.drive(0, false, false);
+      updateConfetti(dt);
+      return;
+    }
 
     raceTime += dt;
 
@@ -437,15 +571,16 @@
     if (keys.right) player.x += steerSpeed;
 
     // Centrifugal push through corners.
-    player.x -= seg.curve * speedPct * speedPct * CENTRIFUGAL * dt * 3;
+    player.x -= seg.curve * speedPct * speedPct * M.centrifugal * dt * 3;
 
     if (keys.gas)        player.speed += ACCEL * dt;
     else if (keys.brake) player.speed += BRAKING * dt;
     else                 player.speed += DECEL * dt;
 
     var offRoad = Math.abs(player.x) > 1;
+    audio.drive(speedPct, offRoad, true);
     if (offRoad) {
-      if (player.speed > OFF_MAX) player.speed += OFF_DECEL * dt;
+      if (player.speed > M.offMax) player.speed += M.offDecel * dt;
       player.bump = Math.min(1, player.bump + dt * 6);
     } else {
       player.bump = Math.max(0, player.bump - dt * 4);
@@ -471,13 +606,31 @@
     player.z += player.speed * dt;
 
     // Rivals drive their own line.
+    var finishZ = finishLine * SEG_LEN;
+    var homeStretch = player.z > finishZ * 0.92;
+
     for (var j = 0; j < cars.length; j++) {
       var r = cars[j];
       var rseg = findSegment(r.z);
-      r.x -= rseg.curve * (r.speed / MAX_SPEED) * CENTRIFUGAL * dt * 2.2;
+      r.x -= rseg.curve * (r.speed / MAX_SPEED) * M.centrifugal * dt * 2.2;
       r.x += Math.sin(r.z / 4200 + j) * dt * 0.35 + r.drift * dt * 0.2;
       r.x = Math.max(-0.85, Math.min(0.85, r.x));
-      r.z = Math.min(r.z + r.speed * dt, finishLine * SEG_LEN);
+
+      // Rubber banding: rivals well ahead ease off, stragglers push on, and over the
+      // final stretch anyone still leading gives the player a shot at the win.
+      var target = 1;
+      if (M.rubber) {
+        var gap = (r.z - player.z) / SEG_LEN;      // in segments, + = ahead
+        if (gap > 30) target = 1 - 0.15 * M.rubber * Math.min(1, (gap - 30) / 90);
+        else if (gap < -30) target = 1 + 0.10 * M.rubber * Math.min(1, (-gap - 30) / 90);
+        if (homeStretch && gap > 0) target *= 1 - 0.20 * M.rubber;
+        // Birthday mode only: leaders wait around before the flag so the lap ends in P1.
+        if (M.rubber >= 1 && gap > 0 && r.z > finishZ * 0.92) target *= 0.6;
+      }
+      r.pace += (target - r.pace) * Math.min(1, dt);
+      r.speed = r.baseSpeed * r.pace;
+
+      r.z = Math.min(r.z + r.speed * dt, finishZ);
     }
 
     if (player.z >= finishLine * SEG_LEN) {
@@ -798,7 +951,7 @@
     ctx.restore();
 
     // Speed streaks.
-    if (speedPct > 0.55) {
+    if (speedPct > 0.55 && !reducedMotion) {
       ctx.globalAlpha = (speedPct - 0.55) * 0.5;
       ctx.strokeStyle = "#ffffff";
       ctx.lineWidth = Math.max(1, W * 0.002);
@@ -857,7 +1010,122 @@
     ctx.closePath();
   }
 
+  // ------------------------------------------------------------------- audio
+  // Everything is synthesised — no files, so the game stays one offline-capable page.
+  var audio = (function () {
+    var ac = null, master = null, engine = null, engineGain = null, grassGain = null;
+    var muted = store("f1mute") === "1";
+    var noiseBuffer = null;
+
+    function ready() {
+      if (muted) return false;
+      if (ac) { if (ac.state === "suspended") ac.resume(); return true; }
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return false;
+      try { ac = new AC(); } catch (e) { return false; }
+
+      master = ac.createGain();
+      master.gain.value = 0.5;
+      master.connect(ac.destination);
+
+      // Engine: two detuned saws through a lowpass, pitch follows road speed.
+      engineGain = ac.createGain();
+      engineGain.gain.value = 0;
+      var lp = ac.createBiquadFilter();
+      lp.type = "lowpass";
+      lp.frequency.value = 1400;
+      engineGain.connect(lp);
+      lp.connect(master);
+
+      engine = [ac.createOscillator(), ac.createOscillator()];
+      engine[0].type = "sawtooth";
+      engine[1].type = "sawtooth";
+      engine[1].detune.value = -14;
+      engine.forEach(function (o) { o.frequency.value = 40; o.connect(engineGain); o.start(); });
+
+      // Tyre noise for the grass, gated by its own gain.
+      var len = Math.floor(ac.sampleRate * 1.5);
+      noiseBuffer = ac.createBuffer(1, len, ac.sampleRate);
+      var d = noiseBuffer.getChannelData(0);
+      for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+      var src = ac.createBufferSource();
+      src.buffer = noiseBuffer;
+      src.loop = true;
+      var bp = ac.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = 900;
+      grassGain = ac.createGain();
+      grassGain.gain.value = 0;
+      src.connect(bp); bp.connect(grassGain); grassGain.connect(master);
+      src.start();
+
+      return true;
+    }
+
+    function tone(freq, dur, type, gain, delay) {
+      if (!ready()) return;
+      var t0 = ac.currentTime + (delay || 0);
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.type = type || "square";
+      o.frequency.setValueAtTime(freq, t0);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(gain || 0.15, t0 + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(master);
+      o.start(t0); o.stop(t0 + dur + 0.05);
+    }
+
+    return {
+      start: function () { ready(); },
+
+      // Called every frame while the car is on track.
+      drive: function (speedPct, offRoad, running) {
+        if (!ac || muted) return;
+        var t = ac.currentTime;
+        engine.forEach(function (o, i) {
+          o.frequency.setTargetAtTime(40 + speedPct * 260 + i * 3, t, 0.08);
+        });
+        engineGain.gain.setTargetAtTime(running ? 0.05 + speedPct * 0.07 : 0, t, 0.15);
+        grassGain.gain.setTargetAtTime(offRoad && running ? 0.05 + speedPct * 0.10 : 0, t, 0.08);
+      },
+
+      light: function (n) { tone(n < 5 ? 620 : 980, n < 5 ? 0.16 : 0.55, "square", 0.12); },
+
+      fanfare: function () {
+        [0, 4, 7, 12].forEach(function (semi, i) {
+          tone(392 * Math.pow(2, semi / 12), 0.5, "triangle", 0.13, i * 0.13);
+        });
+        tone(392 * 2, 1.1, "triangle", 0.10, 0.55);
+      },
+
+      pop: function () { tone(180 + Math.random() * 320, 0.09, "triangle", 0.07); },
+
+      muted: function () { return muted; },
+      state: function () { return ac ? ac.state : "none"; },
+
+      toggle: function () {
+        muted = !muted;
+        store("f1mute", muted ? "1" : "0");
+        if (muted && ac) { master.gain.value = 0; }
+        else if (ac) { master.gain.value = 0.5; ready(); }
+        return muted;
+      }
+    };
+  })();
+
+  var elSound = document.getElementById("sound");
+  function paintSound() {
+    var off = audio.muted();
+    elSound.textContent = off ? "🔇" : "♪";
+    elSound.classList.toggle("off", off);
+    elSound.setAttribute("aria-pressed", String(!off));
+  }
+  elSound.addEventListener("click", function () { audio.toggle(); paintSound(); });
+  paintSound();
+
   // ---------------------------------------------------------------- confetti
+  var reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
   var confetti = [];
   var fxDirty = false;
   var CONF_COLORS = ["#e10600", "#ffd166", "#ffffff", "#00d2be", "#0090ff", "#ff8000", "#c8a2ff", "#3ddc63"];
@@ -884,7 +1152,11 @@
   function updateConfetti(dt) {
     if (state === STATE.FINISH) {
       confettiTimer -= dt;
-      if (confettiTimer <= 0) { burstConfetti(40); confettiTimer = 0.7; }
+      if (confettiTimer <= 0) {
+        burstConfetti(reducedMotion ? 18 : 40);
+        audio.pop();
+        confettiTimer = 0.7;
+      }
     }
     for (var i = confetti.length - 1; i >= 0; i--) {
       var p = confetti[i];
@@ -960,7 +1232,9 @@
     },
     getState: function () { return state; },
     x: function () { return player.x; },
-    progress: function () { return player.z / (finishLine * SEG_LEN); }
+    progress: function () { return player.z / (finishLine * SEG_LEN); },
+    mode: function () { return M.id; },
+    audioState: function () { return audio.state(); }
   };
 })();
 </script>
