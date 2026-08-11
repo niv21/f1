@@ -1017,6 +1017,7 @@
     var muted = store("f1mute") === "1";
     var noiseBuffer = null;
     var engineLp = null, engineNoise = null, engineNoiseBp = null, pulseDepth = null;
+    var octaveGain = null, windGain = null, windHp = null;
     var gear = 0, songUntil = 0;
 
     function ready() {
@@ -1071,10 +1072,10 @@
       engine[0].type = "sawtooth";               // fundamental
       engine[1].type = "square";                 // octave up, quieter
       engine[2].type = "sawtooth";               // the firing-rate LFO
-      var octave = ac.createGain();
-      octave.gain.value = 0.35;
+      octaveGain = ac.createGain();
+      octaveGain.gain.value = 0.15;              // quiet down low, opens up with speed
       engine[0].connect(engineGain);
-      engine[1].connect(octave); octave.connect(engineGain);
+      engine[1].connect(octaveGain); octaveGain.connect(engineGain);
       engine[2].connect(pulseDepth); pulseDepth.connect(pulse.gain);
       engine.forEach(function (o) { o.frequency.value = 40; o.start(); });
 
@@ -1092,6 +1093,19 @@
       engineNoiseBp.connect(engineNoise);
       engineNoise.connect(engineLp);
       engineNoiseSrc.start();
+
+      // Air rushing past the car: near silent at a crawl, unmistakable at top speed.
+      // It bypasses the engine filter and pulsing so it reads as wind, not engine.
+      windGain = ac.createGain();
+      windGain.gain.value = 0;
+      windHp = ac.createBiquadFilter();
+      windHp.type = "highpass";
+      windHp.frequency.value = 900;
+      var windSrc = ac.createBufferSource();
+      windSrc.buffer = noiseBuffer;
+      windSrc.loop = true;
+      windSrc.connect(windHp); windHp.connect(windGain); windGain.connect(master);
+      windSrc.start();
 
       // Tyre noise for the grass, gated by its own gain.
       var src = ac.createBufferSource();
@@ -1129,22 +1143,36 @@
         if (!ac || muted) return;
         var t = ac.currentTime;
 
-        // Five gears: revs climb inside a gear and drop at every shift, so the pitch
-        // never makes one long glide (which is what made this sound like a siren).
-        var GEARS = 5;
-        var g = Math.min(GEARS - 1, Math.floor(speedPct * GEARS));
-        var rpm = 0.45 + (speedPct * GEARS - g) * 0.55;
-        var fundamental = 32 + rpm * 78;                     // ~32-110 Hz: a rumble
+        // Gears get longer as the car speeds up, so shifts are frequent off the line and
+        // rare at the top — the rhythm alone tells you how fast you are going.
+        var TOP = [0.13, 0.29, 0.48, 0.72, 1.01];
+        var g = 0;
+        while (g < TOP.length - 1 && speedPct >= TOP[g]) g++;
+        var from = g === 0 ? 0 : TOP[g - 1];
+        var rpm = 0.42 + Math.min(1, (speedPct - from) / (TOP[g] - from)) * 0.58;
+
+        // Each gear also sits higher than the last, so first gear and fifth are different
+        // sounds rather than the same 67-110 Hz sweep repeated five times.
+        var base = 34 + g * 7;                               // 34 -> 62 Hz
+        var span = 58 + g * 9;                               // wider, denser up top
+        var fundamental = base + rpm * span;                 // ~48 Hz idle -> ~128 Hz flat out
 
         engine[0].frequency.setTargetAtTime(fundamental, t, 0.05);
         engine[1].frequency.setTargetAtTime(fundamental * 2, t, 0.05);
         engine[2].frequency.setTargetAtTime(fundamental / 2, t, 0.05);
 
-        // Brightness follows the revs instead of the pitch running away.
-        engineLp.frequency.setTargetAtTime(400 + rpm * 2200 * (0.6 + speedPct * 0.4), t, 0.06);
-        engineNoiseBp.frequency.setTargetAtTime(fundamental * (6 + speedPct * 4), t, 0.06);
-        engineNoise.gain.setTargetAtTime(running ? 0.05 + speedPct * 0.16 : 0, t, 0.10);
-        pulseDepth.gain.setTargetAtTime(0.34 - speedPct * 0.16, t, 0.10);
+        // Timbre morphs across the speed range: a chugging rumble down low, a dense roar
+        // up top. Brightness follows the revs instead of the pitch running away.
+        engineLp.frequency.setTargetAtTime(320 + rpm * 900 + speedPct * speedPct * 3600, t, 0.06);
+        engineNoiseBp.frequency.setTargetAtTime(fundamental * (5 + speedPct * 7), t, 0.06);
+        engineNoise.gain.setTargetAtTime(running ? 0.04 + speedPct * 0.18 : 0, t, 0.10);
+        octaveGain.gain.setTargetAtTime(0.12 + speedPct * 0.45, t, 0.12);
+        pulseDepth.gain.setTargetAtTime(0.46 - speedPct * 0.34, t, 0.10);
+
+        // Wind builds quadratically, so it is inaudible at a crawl and loud at top speed.
+        var wind = Math.max(0, speedPct - 0.18) / 0.82;
+        windHp.frequency.setTargetAtTime(700 + speedPct * 1500, t, 0.10);
+        windGain.gain.setTargetAtTime(running ? wind * wind * 0.10 : 0, t, 0.12);
 
         var level = running ? 0.035 + speedPct * 0.045 : 0;
         if (running && throttle === false) level *= 0.55;    // lifting off eases the roar
