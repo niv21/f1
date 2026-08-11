@@ -578,7 +578,7 @@
     else                 player.speed += DECEL * dt;
 
     var offRoad = Math.abs(player.x) > 1;
-    audio.drive(speedPct, offRoad, true);
+    audio.drive(speedPct, offRoad, true, keys.gas);
     if (offRoad) {
       if (player.speed > M.offMax) player.speed += M.offDecel * dt;
       player.bump = Math.min(1, player.bump + dt * 6);
@@ -1016,6 +1016,8 @@
     var ac = null, master = null, engine = null, engineGain = null, grassGain = null;
     var muted = store("f1mute") === "1";
     var noiseBuffer = null;
+    var engineLp = null, engineNoise = null, engineNoiseBp = null, pulseDepth = null;
+    var gear = 0, songUntil = 0;
 
     function ready() {
       if (muted) return false;
@@ -1028,27 +1030,70 @@
       master.gain.value = 0.5;
       master.connect(ac.destination);
 
-      // Engine: two detuned saws through a lowpass, pitch follows road speed.
-      engineGain = ac.createGain();
-      engineGain.gain.value = 0;
-      var lp = ac.createBiquadFilter();
-      lp.type = "lowpass";
-      lp.frequency.value = 1400;
-      engineGain.connect(lp);
-      lp.connect(master);
-
-      engine = [ac.createOscillator(), ac.createOscillator()];
-      engine[0].type = "sawtooth";
-      engine[1].type = "sawtooth";
-      engine[1].detune.value = -14;
-      engine.forEach(function (o) { o.frequency.value = 40; o.connect(engineGain); o.start(); });
-
-      // Tyre noise for the grass, gated by its own gain.
+      // White noise, shared by the engine's intake layer and the grass hiss.
       var len = Math.floor(ac.sampleRate * 1.5);
       noiseBuffer = ac.createBuffer(1, len, ac.sampleRate);
       var d = noiseBuffer.getChannelData(0);
       for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
 
+      // Engine. A plain oscillator sliding up the scale reads as a siren, so the sound is
+      // built like an engine instead: a low fundamental that resets on every gear change,
+      // soft-clipped for grit, an intake noise layer, and amplitude pulsing at the firing
+      // rate. The filter — not the pitch — opens up as the revs climb.
+      engineGain = ac.createGain();
+      engineGain.gain.value = 0;
+
+      engineLp = ac.createBiquadFilter();
+      engineLp.type = "lowpass";
+      engineLp.frequency.value = 400;
+      engineLp.Q.value = 6;
+
+      var shaper = ac.createWaveShaper();
+      var curve = new Float32Array(1024);
+      for (var s = 0; s < 1024; s++) {
+        var xs = (s / 1023) * 2 - 1;
+        curve[s] = Math.tanh(xs * 2.4);          // soft clip -> mechanical harmonics
+      }
+      shaper.curve = curve;
+
+      // Pulsing: an LFO at the firing rate rides on top of a fixed offset.
+      pulseDepth = ac.createGain();
+      pulseDepth.gain.value = 0.30;
+      var pulse = ac.createGain();
+      pulse.gain.value = 0.70;                   // steady part; LFO adds the rest
+
+      engineGain.connect(shaper);
+      shaper.connect(engineLp);
+      engineLp.connect(pulse);
+      pulse.connect(master);
+
+      engine = [ac.createOscillator(), ac.createOscillator(), ac.createOscillator()];
+      engine[0].type = "sawtooth";               // fundamental
+      engine[1].type = "square";                 // octave up, quieter
+      engine[2].type = "sawtooth";               // the firing-rate LFO
+      var octave = ac.createGain();
+      octave.gain.value = 0.35;
+      engine[0].connect(engineGain);
+      engine[1].connect(octave); octave.connect(engineGain);
+      engine[2].connect(pulseDepth); pulseDepth.connect(pulse.gain);
+      engine.forEach(function (o) { o.frequency.value = 40; o.start(); });
+
+      // Intake roar: noise tracking the revs, mixed under the tone.
+      engineNoise = ac.createGain();
+      engineNoise.gain.value = 0;
+      engineNoiseBp = ac.createBiquadFilter();
+      engineNoiseBp.type = "bandpass";
+      engineNoiseBp.frequency.value = 300;
+      engineNoiseBp.Q.value = 1.4;
+      var engineNoiseSrc = ac.createBufferSource();
+      engineNoiseSrc.buffer = noiseBuffer;
+      engineNoiseSrc.loop = true;
+      engineNoiseSrc.connect(engineNoiseBp);
+      engineNoiseBp.connect(engineNoise);
+      engineNoise.connect(engineLp);
+      engineNoiseSrc.start();
+
+      // Tyre noise for the grass, gated by its own gain.
       var src = ac.createBufferSource();
       src.buffer = noiseBuffer;
       src.loop = true;
@@ -1080,26 +1125,70 @@
       start: function () { ready(); },
 
       // Called every frame while the car is on track.
-      drive: function (speedPct, offRoad, running) {
+      drive: function (speedPct, offRoad, running, throttle) {
         if (!ac || muted) return;
         var t = ac.currentTime;
-        engine.forEach(function (o, i) {
-          o.frequency.setTargetAtTime(40 + speedPct * 260 + i * 3, t, 0.08);
-        });
-        engineGain.gain.setTargetAtTime(running ? 0.05 + speedPct * 0.07 : 0, t, 0.15);
+
+        // Five gears: revs climb inside a gear and drop at every shift, so the pitch
+        // never makes one long glide (which is what made this sound like a siren).
+        var GEARS = 5;
+        var g = Math.min(GEARS - 1, Math.floor(speedPct * GEARS));
+        var rpm = 0.45 + (speedPct * GEARS - g) * 0.55;
+        var fundamental = 32 + rpm * 78;                     // ~32-110 Hz: a rumble
+
+        engine[0].frequency.setTargetAtTime(fundamental, t, 0.05);
+        engine[1].frequency.setTargetAtTime(fundamental * 2, t, 0.05);
+        engine[2].frequency.setTargetAtTime(fundamental / 2, t, 0.05);
+
+        // Brightness follows the revs instead of the pitch running away.
+        engineLp.frequency.setTargetAtTime(400 + rpm * 2200 * (0.6 + speedPct * 0.4), t, 0.06);
+        engineNoiseBp.frequency.setTargetAtTime(fundamental * (6 + speedPct * 4), t, 0.06);
+        engineNoise.gain.setTargetAtTime(running ? 0.05 + speedPct * 0.16 : 0, t, 0.10);
+        pulseDepth.gain.setTargetAtTime(0.34 - speedPct * 0.16, t, 0.10);
+
+        var level = running ? 0.035 + speedPct * 0.045 : 0;
+        if (running && throttle === false) level *= 0.55;    // lifting off eases the roar
+        if (g !== gear) {                                    // audible cut on the shift
+          gear = g;
+          engineGain.gain.cancelScheduledValues(t);
+          engineGain.gain.setValueAtTime(level * 0.25, t);
+          engineGain.gain.setTargetAtTime(level, t + 0.06, 0.05);
+        } else {
+          engineGain.gain.setTargetAtTime(level, t, 0.12);
+        }
+
         grassGain.gain.setTargetAtTime(offRoad && running ? 0.05 + speedPct * 0.10 : 0, t, 0.08);
       },
 
       light: function (n) { tone(n < 5 ? 620 : 980, n < 5 ? 0.16 : 0.55, "square", 0.12); },
 
+      // "Happy Birthday to You" — the melody comes from "Good Morning to All" (1893) and
+      // is public domain. Semitones from middle C, lengths in beats.
       fanfare: function () {
-        [0, 4, 7, 12].forEach(function (semi, i) {
-          tone(392 * Math.pow(2, semi / 12), 0.5, "triangle", 0.13, i * 0.13);
+        if (!ready()) return;
+        var SONG = [
+          [7, 0.75], [7, 0.25], [9, 1], [7, 1], [12, 1], [11, 2],
+          [7, 0.75], [7, 0.25], [9, 1], [7, 1], [14, 1], [12, 2],
+          [7, 0.75], [7, 0.25], [19, 1], [16, 1], [12, 1], [11, 1], [9, 1],
+          [17, 0.75], [17, 0.25], [16, 1], [12, 1], [14, 1], [12, 2]
+        ];
+        var beat = 0.4, at = 0.25;
+        songUntil = ac.currentTime + 0.25;
+        SONG.forEach(function (n) {
+          var f = 261.63 * Math.pow(2, n[0] / 12);
+          var dur = n[1] * beat;
+          tone(f, dur * 0.92, "triangle", 0.16, at);
+          if (n[1] >= 1) tone(f / 2, dur * 0.92, "sine", 0.07, at);   // gentle lower voice
+          at += dur;
         });
-        tone(392 * 2, 1.1, "triangle", 0.10, 0.55);
+        songUntil += at;
       },
 
-      pop: function () { tone(180 + Math.random() * 320, 0.09, "triangle", 0.07); },
+      // Kept quiet while the song plays so the melody stays legible.
+      pop: function () {
+        if (ac && ac.currentTime < songUntil) return;
+        tone(180 + Math.random() * 320, 0.09, "triangle", 0.07);
+      },
 
       muted: function () { return muted; },
       state: function () { return ac ? ac.state : "none"; },
@@ -1234,7 +1323,8 @@
     x: function () { return player.x; },
     progress: function () { return player.z / (finishLine * SEG_LEN); },
     mode: function () { return M.id; },
-    audioState: function () { return audio.state(); }
+    audioState: function () { return audio.state(); },
+    audio: function () { return audio; }
   };
 })();
 </script>
